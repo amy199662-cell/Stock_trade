@@ -2,12 +2,15 @@
 """
 半自動股票分析 Web App
 ======================
-分頁一：自選股觀察與診斷（買進 / 停利 / 停損）
-分頁二：市場強勢標的掃描（60MA + KD 低檔黃金交叉）
+功能：
+1. 分頁一【自選股觀察與診斷】：手動管理自選股清單，按下「一鍵更新與診斷」才會呼叫 yfinance
+   抓取資料並計算 60MA / 10MA / KD(9,3,3)，依規則標示 買進 / 停利 / 停損 狀態。
+2. 分頁二【市場強勢標的推薦】：對預設的市場清單（可自行編輯）進行條件篩選，
+   找出「股價 > 60MA 且 KD 在低檔(<30)出現黃金交叉」的標的，並給出建議進場價與預估停損價。
 
 執行方式：
     pip install streamlit yfinance pandas numpy
-    streamlit run stock_app.py
+    streamlit run stock_analyzer_app.py
 """
 
 import streamlit as st
@@ -16,361 +19,368 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime
 
-# ------------------------------------------------------------------
-# 全域設定
-# ------------------------------------------------------------------
+# ============================================================
+# 基本頁面設定
+# ============================================================
 st.set_page_config(
-    page_title="半自動股票分析工具",
-    page_icon="📈",
+    page_title="股票分析平台",
+    page_icon="📊",
     layout="wide",
 )
 
-# 台股前 30 大權值股（預設市場觀察清單）
+# ============================================================
+# Session State 初始化
+# ============================================================
+# watchlist:      自選股代號清單
+# holdings:       {ticker: {"entry_date", "entry_low", "entry_price"}} 追蹤買進後的進場低點
+# watchlist_result / market_scan_result：暫存上次按下按鈕後的計算結果，避免每次互動都重新整頁時清空
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = ["2330.TW", "2454.TW", "2317.TW"]
+if "holdings" not in st.session_state:
+    st.session_state.holdings = {}
+if "watchlist_result" not in st.session_state:
+    st.session_state.watchlist_result = None
+if "market_scan_result" not in st.session_state:
+    st.session_state.market_scan_result = None
+
+# 預設市場觀察清單（台股權值股代表性抽樣，使用者可於分頁二自行編輯擴充至完整前100大）
 DEFAULT_MARKET_LIST = [
-    "2330.TW", "2317.TW", "2454.TW", "2412.TW", "2882.TW",
-    "2881.TW", "1303.TW", "1301.TW", "2308.TW", "2891.TW",
-    "2886.TW", "3711.TW", "2884.TW", "5880.TW", "2892.TW",
-    "2303.TW", "1216.TW", "2002.TW", "2885.TW", "5871.TW",
-    "3008.TW", "2880.TW", "2887.TW", "6505.TW", "2801.TW",
-    "2382.TW", "4938.TW", "9910.TW", "2603.TW", "1101.TW",
+    "2330.TW", "2317.TW", "2454.TW", "2412.TW", "2308.TW", "2882.TW", "1303.TW",
+    "1301.TW", "2891.TW", "2303.TW", "2881.TW", "2886.TW", "2884.TW", "3711.TW",
+    "2892.TW", "5880.TW", "2885.TW", "2002.TW", "2887.TW", "1216.TW", "2801.TW",
+    "2880.TW", "3008.TW", "2382.TW", "2883.TW", "2890.TW", "1101.TW", "2327.TW",
+    "6505.TW", "5876.TW", "2207.TW", "9910.TW", "2379.TW", "2395.TW", "4938.TW",
+    "2357.TW", "3045.TW", "4904.TW", "2609.TW", "2603.TW", "2615.TW", "1326.TW",
+    "9945.TW", "2912.TW", "1102.TW", "2377.TW", "2408.TW", "3034.TW", "6446.TW",
+    "2474.TW",
 ]
 
-# ------------------------------------------------------------------
-# Session State 初始化
-# ------------------------------------------------------------------
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = ["2330.TW", "2454.TW"]
 
-if "diagnosis_df" not in st.session_state:
-    st.session_state.diagnosis_df = pd.DataFrame()
+# ============================================================
+# 技術指標計算函式
+# ============================================================
+def compute_kd(df: pd.DataFrame, n: int = 9, k_smooth: int = 3, d_smooth: int = 3) -> pd.DataFrame:
+    """
+    計算 KD 指標（台式平滑公式，等同 RSV 以 1/3, 2/3 權重遞迴平滑）
+    K = 前一日K * (2/3) + 今日RSV * (1/3)
+    D = 前一日D * (2/3) + 今日K  * (1/3)
+    起始 K = D = 50
+    """
+    low_min = df["Low"].rolling(window=n, min_periods=n).min()
+    high_max = df["High"].rolling(window=n, min_periods=n).max()
 
-if "scan_df" not in st.session_state:
-    st.session_state.scan_df = pd.DataFrame()
+    rsv = (df["Close"] - low_min) / (high_max - low_min) * 100
+    rsv = rsv.fillna(50)  # 資料不足時以中性值 50 帶入，避免 NaN 造成後續計算中斷
 
-if "last_update_time" not in st.session_state:
-    st.session_state.last_update_time = None
+    k_values, d_values = [], []
+    k_prev, d_prev = 50.0, 50.0
+    for val in rsv:
+        k_curr = k_prev * (k_smooth - 1) / k_smooth + val * (1 / k_smooth)
+        d_curr = d_prev * (d_smooth - 1) / d_smooth + k_curr * (1 / d_smooth)
+        k_values.append(k_curr)
+        d_values.append(d_curr)
+        k_prev, d_prev = k_curr, d_curr
 
-if "last_scan_time" not in st.session_state:
-    st.session_state.last_scan_time = None
+    df["K"] = k_values
+    df["D"] = d_values
+    return df
 
 
-# ------------------------------------------------------------------
-# 資料抓取（加上快取，避免同一 ticker 重複打 API）
-# ------------------------------------------------------------------
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """計算 10MA / 60MA / KD，回傳新增欄位後的 DataFrame"""
+    df = df.copy()
+    df["MA10"] = df["Close"].rolling(10).mean()
+    df["MA60"] = df["Close"].rolling(60).mean()
+    df = compute_kd(df)
+    return df
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_stock_data(ticker: str, period: str = "1y") -> pd.DataFrame | None:
-    """抓取單一股票的歷史 OHLCV 資料"""
+def fetch_data(ticker: str, period: str = "9mo") -> pd.DataFrame | None:
+    """
+    透過 yfinance 抓取歷史資料。
+    - 使用 9 個月區間，確保 60MA / KD(9,3,3) 有足夠的回看資料。
+    - auto_adjust=False：技術分析慣例使用未還原股價計算均線與 KD。
+    - 加上 cache（10 分鐘）避免同一次 session 中重複呼叫 API。
+    """
     try:
-        df = yf.Ticker(ticker).history(period=period)
+        df = yf.download(ticker, period=period, progress=False, auto_adjust=False, threads=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         if df is None or df.empty:
             return None
+        df = df.dropna(subset=["Close", "High", "Low"])
         return df
     except Exception:
         return None
 
 
-# ------------------------------------------------------------------
-# 技術指標計算
-# ------------------------------------------------------------------
-def calc_indicators(df: pd.DataFrame, kd_n: int = 9, kd_m1: int = 3, kd_m2: int = 3) -> pd.DataFrame:
-    """計算 MA10 / MA60 / KD(9,3,3)"""
-    df = df.copy()
-
-    # --- 移動平均線 ---
-    df["MA10"] = df["Close"].rolling(window=10).mean()
-    df["MA60"] = df["Close"].rolling(window=60).mean()
-
-    # --- KD 指標（台股慣用平滑公式）---
-    low_n = df["Low"].rolling(window=kd_n).min()
-    high_n = df["High"].rolling(window=kd_n).max()
-    rsv = (df["Close"] - low_n) / (high_n - low_n) * 100
-    rsv = rsv.fillna(50)  # 前 n 天資料不足時，用中性值 50 帶入
-
-    k_values, d_values = [], []
-    prev_k, prev_d = 50.0, 50.0
-    for val in rsv:
-        k = prev_k * (kd_m1 - 1) / kd_m1 + val / kd_m1
-        d = prev_d * (kd_m2 - 1) / kd_m2 + k / kd_m2
-        k_values.append(k)
-        d_values.append(d)
-        prev_k, prev_d = k, d
-
-    df["K"] = k_values
-    df["D"] = d_values
-
-    # 黃金交叉判斷：前一天 K<=D，今天 K>D
-    df["KD_GOLDEN_CROSS"] = (df["K"].shift(1) <= df["D"].shift(1)) & (df["K"] > df["D"])
-    return df
-
-
-# ------------------------------------------------------------------
-# 分頁一：個股診斷邏輯
-# ------------------------------------------------------------------
-def diagnose_stock(df: pd.DataFrame):
+# ============================================================
+# 分頁一：自選股診斷邏輯
+# ============================================================
+def diagnose_stock(ticker: str, df: pd.DataFrame | None) -> dict:
     """
-    判斷邏輯：
-    1. 買進：股價 > MA60 且 KD 在低檔(<30)出現黃金交叉
-    2. 停利：收盤價跌破 MA10（持有中才觸發）
-    3. 停損：跌破「進場日」的最低點（持有中才觸發）
-    4. 若無有效訊號則為「觀望」，若買進後尚未觸發停利/停損則為「持有中」
+    對單一自選股計算指標並依規則判斷狀態：
+      買進：股價 > 60MA 且 KD 低檔(<30)出現黃金交叉
+      停利：收盤價跌破 10MA
+      停損：跌破「進場日」的最低點
+    使用 st.session_state.holdings 追蹤「是否已進場」與「進場日低點」。
     """
-    if len(df) < 70:
-        return "資料不足", None, None
+    if df is None or len(df) < 61:
+        return {"股票代號": ticker, "狀態": "⚠️ 資料不足或抓取失敗"}
 
-    latest = df.iloc[-1]
+    df = compute_indicators(df)
+    latest, prev = df.iloc[-1], df.iloc[-2]
 
-    # 找出符合「低檔黃金交叉 + 站上 60MA」條件的所有歷史買進訊號日
-    buy_mask = (
-        (df["Close"] > df["MA60"])
-        & (df["K"] < 30)
-        & (df["D"] < 30)
-        & df["KD_GOLDEN_CROSS"]
-    )
-    buy_dates = df.index[buy_mask]
+    price = float(latest["Close"])
+    ma60 = float(latest["MA60"]) if pd.notna(latest["MA60"]) else np.nan
+    ma10 = float(latest["MA10"]) if pd.notna(latest["MA10"]) else np.nan
+    k, d = float(latest["K"]), float(latest["D"])
+    k_prev, d_prev = float(prev["K"]), float(prev["D"])
+    trade_date = df.index[-1].strftime("%Y-%m-%d")
 
-    if len(buy_dates) == 0:
-        return "觀望", None, None
+    golden_cross = (k_prev < d_prev) and (k > d)
+    low_zone = (k < 30) and (d < 30)
+    buy_signal = (not np.isnan(ma60)) and (price > ma60) and golden_cross and low_zone
 
-    # 取最近一次的買進訊號日，作為「進場日」
-    entry_date = buy_dates[-1]
-    entry_low = df.loc[entry_date, "Low"]
+    holding = st.session_state.holdings.get(ticker)
+    status = "⚪ 觀察中"
 
-    # 檢查「進場日」之後、今天之前，是否已經觸發過停利或停損（代表這筆訊號已出場）
-    after_entry = df.loc[entry_date:]
-    exited = False
-    if len(after_entry) > 2:
-        between = after_entry.iloc[1:-1]  # 進場日隔天 ~ 昨天
-        if (between["Close"] < between["MA10"]).any() or (between["Close"] < entry_low).any():
-            exited = True
-
-    if not exited:
-        # 部位仍視為持有中，逐一檢查今天的出場條件
-        if latest["Close"] < entry_low:
-            return "停損", entry_date, entry_low
-        elif latest["Close"] < latest["MA10"]:
-            return "停利", entry_date, entry_low
-        elif bool(buy_mask.iloc[-1]):
-            return "買進", entry_date, entry_low
+    if buy_signal and not holding:
+        # 首次觸發買進訊號 -> 記錄進場日低點，作為未來停損判斷基準
+        st.session_state.holdings[ticker] = {
+            "entry_date": trade_date,
+            "entry_low": float(latest["Low"]),
+            "entry_price": price,
+        }
+        status = "🟢 買進"
+    elif holding:
+        entry_low = holding["entry_low"]
+        if price < entry_low:
+            status = "🔴 停損"
+            st.session_state.holdings.pop(ticker, None)  # 出場後清除持股記錄
+        elif not np.isnan(ma10) and price < ma10:
+            status = "🟠 停利"
+            st.session_state.holdings.pop(ticker, None)  # 出場後清除持股記錄
         else:
-            return "持有中", entry_date, entry_low
-    else:
-        # 舊訊號已出場，檢查今天是否是新的買進訊號
-        if bool(buy_mask.iloc[-1]):
-            return "買進", df.index[-1], latest["Low"]
-        return "觀望", None, None
+            status = "🔵 持有中"
+
+    return {
+        "股票代號": ticker,
+        "最新收盤": round(price, 2),
+        "60MA": round(ma60, 2) if not np.isnan(ma60) else None,
+        "10MA": round(ma10, 2) if not np.isnan(ma10) else None,
+        "K值": round(k, 2),
+        "D值": round(d, 2),
+        "狀態": status,
+        "進場參考低點": round(holding["entry_low"], 2) if (ticker in st.session_state.holdings) else None,
+        "更新日期": trade_date,
+    }
 
 
-# ------------------------------------------------------------------
-# 表格色彩樣式
-# ------------------------------------------------------------------
-STATUS_STYLE = {
-    "買進":   "background-color:#d4f7dc; color:#1a7431; font-weight:700;",
-    "停利":   "background-color:#fff3cd; color:#8a6100; font-weight:700;",
-    "停損":   "background-color:#f8d7da; color:#a31621; font-weight:700;",
-    "持有中": "background-color:#e2e3ff; color:#3949ab; font-weight:600;",
-    "觀望":   "background-color:#f0f0f0; color:#666666;",
-    "資料不足": "background-color:#f0f0f0; color:#999999;",
-}
+def style_watchlist(df: pd.DataFrame):
+    """依「狀態」欄位替表格套上顏色標籤"""
+    def color_status(val):
+        if "買進" in str(val):
+            return "background-color:#d4edda; color:#155724; font-weight:bold;"
+        elif "停利" in str(val):
+            return "background-color:#fff3cd; color:#856404; font-weight:bold;"
+        elif "停損" in str(val):
+            return "background-color:#f8d7da; color:#721c24; font-weight:bold;"
+        elif "持有" in str(val):
+            return "background-color:#d1ecf1; color:#0c5460; font-weight:bold;"
+        elif "觀察" in str(val):
+            return "background-color:#f0f0f0; color:#555555;"
+        else:
+            return "background-color:#f5c6cb; color:#721c24;"
+    return df.style.applymap(color_status, subset=["狀態"])
 
 
-def style_status_col(val):
-    return STATUS_STYLE.get(val, "")
+# ============================================================
+# 分頁二：市場強勢標的篩選邏輯
+# ============================================================
+def scan_stock(ticker: str, df: pd.DataFrame | None) -> dict | None:
+    """
+    篩選條件：股價 > 60MA 且 KD 在 30 以下出現黃金交叉
+    符合條件則回傳建議進場價（以當日收盤為基準）與預估停損價（當日低點）
+    """
+    if df is None or len(df) < 61:
+        return None
+
+    df = compute_indicators(df)
+    latest, prev = df.iloc[-1], df.iloc[-2]
+
+    price = float(latest["Close"])
+    ma60 = float(latest["MA60"]) if pd.notna(latest["MA60"]) else np.nan
+    k, d = float(latest["K"]), float(latest["D"])
+    k_prev, d_prev = float(prev["K"]), float(prev["D"])
+
+    golden_cross = (k_prev < d_prev) and (k > d)
+    low_zone = (k < 30) and (d < 30)
+
+    if np.isnan(ma60) or not (price > ma60 and golden_cross and low_zone):
+        return None
+
+    entry_price = round(price, 2)
+    stop_loss = round(float(latest["Low"]), 2)
+    risk = entry_price - stop_loss
+    reward_risk_note = "N/A" if risk <= 0 else round((entry_price - ma60 * 0) / risk, 2)  # 佔位，避免除以0
+
+    return {
+        "股票代號": ticker,
+        "收盤價": entry_price,
+        "60MA": round(ma60, 2),
+        "K值": round(k, 2),
+        "D值": round(d, 2),
+        "建議進場價": entry_price,
+        "預估停損價": stop_loss,
+        "停損風險(%)": round((entry_price - stop_loss) / entry_price * 100, 2) if entry_price else None,
+        "更新日期": df.index[-1].strftime("%Y-%m-%d"),
+    }
 
 
-# ==================================================================
-# UI 主體
-# ==================================================================
-st.title("📈 半自動股票分析工具")
-st.caption("以 60MA 站上趨勢 + KD 低檔交叉為核心，輔助買進 / 停利 / 停損判斷（僅供研究參考，非投資建議）")
+# ============================================================
+# UI：頁首
+# ============================================================
+st.title("📊 半自動股票分析平台")
+st.caption("資料來源：Yahoo Finance（yfinance）｜僅供技術分析參考，非投資建議")
 
-tab1, tab2 = st.tabs(["🔍 自選股觀察與診斷", "🚀 市場強勢標的推薦"])
+with st.sidebar:
+    st.header("⚙️ 使用說明")
+    st.markdown(
+        """
+        **半自動設計理念**
+        本工具不會自動連續抓取資料，所有網路請求皆須由使用者
+        點擊「一鍵更新與診斷」或「開始市場掃描」按鈕才會觸發，
+        避免不必要的 API 呼叫與過度交易訊號干擾。
 
-# ------------------------------------------------------------------
-# 分頁一
-# ------------------------------------------------------------------
+        **訊號定義**
+        - 🟢 買進：股價 > 60MA 且 KD 低檔(<30)黃金交叉
+        - 🟠 停利：收盤價跌破 10MA
+        - 🔴 停損：跌破進場日最低點
+        - 🔵 持有中：已進場但尚未觸及停利/停損
+        """
+    )
+    st.divider()
+    st.caption("⚠️ 本工具僅為技術指標運算輔助，不構成任何投資建議。")
+
+tab1, tab2 = st.tabs(["📌 自選股觀察與診斷", "🚀 市場強勢標的推薦"])
+
+# ============================================================
+# 分頁一 UI
+# ============================================================
 with tab1:
     st.subheader("自選股清單管理")
 
-    col_input, col_add = st.columns([4, 1])
+    col_input, col_btn = st.columns([3, 1])
     with col_input:
         new_ticker = st.text_input(
-            "輸入股票代號後按新增（例如：2330.TW）",
+            "輸入股票代號後按下新增（例如 2330.TW、2454.TW）",
             key="new_ticker_input",
             label_visibility="collapsed",
-            placeholder="輸入股票代號，例如 2330.TW",
+            placeholder="例如：2330.TW",
         )
-    with col_add:
-        if st.button("➕ 新增自選股", use_container_width=True):
+    with col_btn:
+        if st.button("➕ 新增至自選股", use_container_width=True):
             t = new_ticker.strip().upper()
-            if t and t not in st.session_state.watchlist:
-                st.session_state.watchlist.append(t)
-                st.rerun()
+            if not t:
+                st.warning("請輸入股票代號")
             elif t in st.session_state.watchlist:
                 st.warning(f"{t} 已在清單中")
+            else:
+                st.session_state.watchlist.append(t)
+                st.success(f"已新增 {t}")
+                st.rerun()
 
-    # 目前自選股（chip 形式 + 刪除按鈕）
     if st.session_state.watchlist:
-        st.write("目前自選股：")
-        chip_cols = st.columns(min(len(st.session_state.watchlist), 8) or 1)
-        for i, ticker in enumerate(st.session_state.watchlist):
-            with chip_cols[i % len(chip_cols)]:
-                st.markdown(f"**{ticker}**")
-                if st.button("🗑️ 刪除", key=f"del_{ticker}"):
-                    st.session_state.watchlist.remove(ticker)
-                    st.rerun()
+        st.write("**目前自選股：**", "、".join(st.session_state.watchlist))
+        to_remove = st.multiselect("選擇要刪除的股票", st.session_state.watchlist, key="remove_select")
+        if st.button("🗑️ 刪除選定股票"):
+            for t in to_remove:
+                st.session_state.watchlist.remove(t)
+                st.session_state.holdings.pop(t, None)
+            st.rerun()
     else:
-        st.info("目前尚無自選股，請先新增。")
+        st.info("目前尚無自選股，請於上方新增。")
 
     st.divider()
 
-    # 大按鈕：一鍵更新與診斷
-    update_clicked = st.button(
-        "🚀 一鍵更新與診斷", type="primary", use_container_width=True,
-        disabled=(len(st.session_state.watchlist) == 0),
-    )
+    # ------- 一鍵更新與診斷 -------
+    if st.button("🔄 一鍵更新與診斷", type="primary", use_container_width=True):
+        if not st.session_state.watchlist:
+            st.warning("請先新增至少一檔自選股")
+        else:
+            results = []
+            progress = st.progress(0, text="準備抓取資料...")
+            total = len(st.session_state.watchlist)
+            for i, ticker in enumerate(st.session_state.watchlist):
+                progress.progress((i + 1) / total, text=f"處理中：{ticker}")
+                df = fetch_data(ticker)
+                results.append(diagnose_stock(ticker, df))
+            progress.empty()
+            st.session_state.watchlist_result = pd.DataFrame(results)
+            st.success(f"更新完成，共處理 {total} 檔股票")
 
-    if update_clicked:
-        results = []
-        progress = st.progress(0, text="準備開始抓取資料...")
-        total = len(st.session_state.watchlist)
+    # ------- 結果表格 -------
+    if st.session_state.watchlist_result is not None and not st.session_state.watchlist_result.empty:
+        st.dataframe(style_watchlist(st.session_state.watchlist_result), use_container_width=True)
 
-        for idx, ticker in enumerate(st.session_state.watchlist):
-            progress.progress((idx) / total, text=f"正在處理 {ticker} ...")
-            df = fetch_stock_data(ticker)
-
-            if df is None or len(df) < 70:
-                results.append({
-                    "股票代號": ticker, "收盤價": "-", "MA10": "-", "MA60": "-",
-                    "K": "-", "D": "-", "診斷狀態": "資料不足", "進場日低點": "-",
-                })
-                continue
-
-            df = calc_indicators(df)
-            status, entry_date, entry_low = diagnose_stock(df)
-            latest = df.iloc[-1]
-
-            results.append({
-                "股票代號": ticker,
-                "收盤價": round(float(latest["Close"]), 2),
-                "MA10": round(float(latest["MA10"]), 2) if not pd.isna(latest["MA10"]) else "-",
-                "MA60": round(float(latest["MA60"]), 2) if not pd.isna(latest["MA60"]) else "-",
-                "K": round(float(latest["K"]), 1),
-                "D": round(float(latest["D"]), 1),
-                "診斷狀態": status,
-                "進場日低點": round(float(entry_low), 2) if entry_low is not None else "-",
-            })
-
-        progress.progress(1.0, text="完成！")
-        progress.empty()
-
-        st.session_state.diagnosis_df = pd.DataFrame(results)
-        st.session_state.last_update_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # 顯示結果表格
-    if not st.session_state.diagnosis_df.empty:
-        st.caption(f"最後更新時間：{st.session_state.last_update_time}")
-        styled = (
-            st.session_state.diagnosis_df.style
-            .applymap(style_status_col, subset=["診斷狀態"])
-        )
-        st.dataframe(styled, use_container_width=True, hide_index=True)
-
-        with st.expander("📖 判斷邏輯說明"):
-            st.markdown(
-                "- **買進**：收盤價 > 60MA，且 KD 在低檔（K、D 皆 < 30）出現黃金交叉\n"
-                "- **持有中**：已觸發買進訊號，尚未跌破 10MA 或進場日低點\n"
-                "- **停利**：收盤價跌破 10MA\n"
-                "- **停損**：收盤價跌破「進場日」當天的最低點\n"
-                "- **觀望**：目前無有效買進訊號"
-            )
+        if st.session_state.holdings:
+            with st.expander("⚙️ 手動管理持股記錄（如需強制出場或修正進場低點）"):
+                reset_ticker = st.selectbox("選擇股票", list(st.session_state.holdings.keys()))
+                if st.button("清除此股票的持股記錄"):
+                    st.session_state.holdings.pop(reset_ticker, None)
+                    st.success(f"已清除 {reset_ticker} 的持股記錄")
+                    st.rerun()
     else:
-        st.info("請點擊上方「一鍵更新與診斷」按鈕以取得最新診斷結果。")
+        st.info("請點擊上方「一鍵更新與診斷」以取得最新分析結果。")
 
-
-# ------------------------------------------------------------------
-# 分頁二
-# ------------------------------------------------------------------
+# ============================================================
+# 分頁二 UI
+# ============================================================
 with tab2:
-    st.subheader("市場強勢標的掃描")
-    st.caption("預設清單：台股前 30 大權值股，可自行調整。")
+    st.subheader("市場觀察清單設定")
+    st.caption("預設為台股權值股代表性清單，可自行編輯（逗號分隔），建議可擴充至完整前100大權值股。")
 
-    market_list = st.multiselect(
-        "掃描標的清單",
-        options=DEFAULT_MARKET_LIST,
-        default=DEFAULT_MARKET_LIST,
+    market_list_str = st.text_area(
+        "市場觀察清單",
+        value=",".join(DEFAULT_MARKET_LIST),
+        height=100,
+        label_visibility="collapsed",
     )
+    market_list = [t.strip().upper() for t in market_list_str.split(",") if t.strip()]
+    st.caption(f"目前清單共 {len(market_list)} 檔股票")
 
-    scan_clicked = st.button(
-        "🚀 開始市場掃描", type="primary", use_container_width=True,
-        disabled=(len(market_list) == 0),
-    )
+    st.divider()
 
-    if scan_clicked:
-        matched = []
-        progress = st.progress(0, text="準備開始掃描...")
-        total = len(market_list)
+    if st.button("🚀 開始市場掃描", type="primary", use_container_width=True):
+        if not market_list:
+            st.warning("市場觀察清單為空，請至少輸入一檔股票代號")
+        else:
+            results = []
+            progress = st.progress(0, text="準備開始掃描...")
+            total = len(market_list)
+            for i, ticker in enumerate(market_list):
+                progress.progress((i + 1) / total, text=f"掃描中：{ticker}")
+                df = fetch_data(ticker)
+                res = scan_stock(ticker, df)
+                if res:
+                    results.append(res)
+            progress.empty()
+            st.session_state.market_scan_result = pd.DataFrame(results)
+            st.success(f"掃描完成，共檢視 {total} 檔股票")
 
-        for idx, ticker in enumerate(market_list):
-            progress.progress(idx / total, text=f"正在掃描 {ticker} ...")
-            df = fetch_stock_data(ticker)
-
-            if df is None or len(df) < 70:
-                continue
-
-            df = calc_indicators(df)
-            latest = df.iloc[-1]
-
-            # 篩選條件：股價 > 60MA，且 KD 低檔（<30）出現黃金交叉
-            cond_above_ma60 = latest["Close"] > latest["MA60"]
-            cond_low_zone = (latest["K"] < 30) and (latest["D"] < 30)
-            cond_golden_cross = bool(latest["KD_GOLDEN_CROSS"])
-
-            if cond_above_ma60 and cond_low_zone and cond_golden_cross:
-                suggested_entry = round(float(latest["Close"]), 2)
-                suggested_stop = round(float(latest["Low"]), 2)
-                risk_pct = round((suggested_entry - suggested_stop) / suggested_entry * 100, 2)
-
-                matched.append({
-                    "股票代號": ticker,
-                    "收盤價": round(float(latest["Close"]), 2),
-                    "MA60": round(float(latest["MA60"]), 2),
-                    "K": round(float(latest["K"]), 1),
-                    "D": round(float(latest["D"]), 1),
-                    "建議進場價": suggested_entry,
-                    "預估停損價": suggested_stop,
-                    "潛在風險(%)": risk_pct,
-                })
-
-        progress.progress(1.0, text="掃描完成！")
-        progress.empty()
-
-        st.session_state.scan_df = pd.DataFrame(matched)
-        st.session_state.last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if not st.session_state.scan_df.empty:
-        st.caption(f"最後掃描時間：{st.session_state.last_scan_time}")
-        st.success(f"共篩選出 {len(st.session_state.scan_df)} 檔符合條件的強勢標的")
-        st.dataframe(
-            st.session_state.scan_df.style.background_gradient(
-                subset=["潛在風險(%)"], cmap="RdYlGn_r"
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-        with st.expander("📖 篩選邏輯說明"):
-            st.markdown(
-                "- 篩選條件：**收盤價 > 60MA**，且 **KD 在低檔（K、D 皆 < 30）出現黃金交叉**\n"
-                "- **建議進場價**：以當日收盤價為參考\n"
-                "- **預估停損價**：以當日最低點為參考\n"
-                "- 此為量化篩選結果，仍建議搭配基本面與大盤環境綜合判斷"
+    if st.session_state.market_scan_result is not None:
+        result_df = st.session_state.market_scan_result
+        if result_df.empty:
+            st.info("目前無符合「站上60MA + KD低檔黃金交叉」條件之標的。")
+        else:
+            st.success(f"🎯 共篩選出 {len(result_df)} 檔強勢標的")
+            st.dataframe(
+                result_df.style.background_gradient(subset=["停損風險(%)"], cmap="RdYlGn_r"),
+                use_container_width=True,
             )
-    elif st.session_state.last_scan_time is not None:
-        st.warning("本次掃描沒有符合條件的標的。")
     else:
-        st.info("請點擊上方「開始市場掃描」按鈕以取得符合條件的強勢標的。")
+        st.info("請點擊上方「開始市場掃描」以取得符合條件的標的。")
 
-# ------------------------------------------------------------------
-# Footer
-# ------------------------------------------------------------------
-st.divider()
-st.caption("⚠️ 本工具僅供技術分析教學與研究參考，不構成投資建議。股市有風險，投資請謹慎評估並自負盈虧。")
+        
