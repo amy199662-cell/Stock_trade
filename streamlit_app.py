@@ -23,7 +23,7 @@ from datetime import datetime
 # 基本頁面設定
 # ============================================================
 st.set_page_config(
-    page_title="股票分析平台",
+    page_title="股市分析平台",
     page_icon="📊",
     layout="wide",
 )
@@ -31,9 +31,6 @@ st.set_page_config(
 # ============================================================
 # Session State 初始化
 # ============================================================
-# watchlist:      自選股代號清單
-# holdings:       {ticker: {"entry_date", "entry_low", "entry_price"}} 追蹤買進後的進場低點
-# watchlist_result / market_scan_result：暫存上次按下按鈕後的計算結果，避免每次互動都重新整頁時清空
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = ["2330.TW", "2454.TW", "2317.TW"]
 if "holdings" not in st.session_state:
@@ -43,7 +40,6 @@ if "watchlist_result" not in st.session_state:
 if "market_scan_result" not in st.session_state:
     st.session_state.market_scan_result = None
 
-# 預設市場觀察清單（台股權值股代表性抽樣，使用者可於分頁二自行編輯擴充至完整前100大）
 DEFAULT_MARKET_LIST = [
     "2330.TW", "2317.TW", "2454.TW", "2412.TW", "2308.TW", "2882.TW", "1303.TW",
     "1301.TW", "2891.TW", "2303.TW", "2881.TW", "2886.TW", "2884.TW", "3711.TW",
@@ -70,7 +66,7 @@ def compute_kd(df: pd.DataFrame, n: int = 9, k_smooth: int = 3, d_smooth: int = 
     high_max = df["High"].rolling(window=n, min_periods=n).max()
 
     rsv = (df["Close"] - low_min) / (high_max - low_min) * 100
-    rsv = rsv.fillna(50)  # 資料不足時以中性值 50 帶入，避免 NaN 造成後續計算中斷
+    rsv = rsv.fillna(50)
 
     k_values, d_values = [], []
     k_prev, d_prev = 50.0, 50.0
@@ -147,7 +143,6 @@ def diagnose_stock(ticker: str, df: pd.DataFrame | None) -> dict:
     status = "⚪ 觀察中"
 
     if buy_signal and not holding:
-        # 首次觸發買進訊號 -> 記錄進場日低點，作為未來停損判斷基準
         st.session_state.holdings[ticker] = {
             "entry_date": trade_date,
             "entry_low": float(latest["Low"]),
@@ -158,10 +153,10 @@ def diagnose_stock(ticker: str, df: pd.DataFrame | None) -> dict:
         entry_low = holding["entry_low"]
         if price < entry_low:
             status = "🔴 停損"
-            st.session_state.holdings.pop(ticker, None)  # 出場後清除持股記錄
+            st.session_state.holdings.pop(ticker, None)
         elif not np.isnan(ma10) and price < ma10:
             status = "🟠 停利"
-            st.session_state.holdings.pop(ticker, None)  # 出場後清除持股記錄
+            st.session_state.holdings.pop(ticker, None)
         else:
             status = "🔵 持有中"
 
@@ -193,7 +188,10 @@ def style_watchlist(df: pd.DataFrame):
             return "background-color:#f0f0f0; color:#555555;"
         else:
             return "background-color:#f5c6cb; color:#721c24;"
-    return df.style.applymap(color_status, subset=["狀態"])
+    styler = df.style
+    if hasattr(styler, "map"):
+        return styler.map(color_status, subset=["狀態"])
+    return styler.applymap(color_status, subset=["狀態"])
 
 
 # ============================================================
@@ -223,8 +221,6 @@ def scan_stock(ticker: str, df: pd.DataFrame | None) -> dict | None:
 
     entry_price = round(price, 2)
     stop_loss = round(float(latest["Low"]), 2)
-    risk = entry_price - stop_loss
-    reward_risk_note = "N/A" if risk <= 0 else round((entry_price - ma60 * 0) / risk, 2)  # 佔位，避免除以0
 
     return {
         "股票代號": ticker,
@@ -242,7 +238,7 @@ def scan_stock(ticker: str, df: pd.DataFrame | None) -> dict | None:
 # ============================================================
 # UI：頁首
 # ============================================================
-st.title("📊 半自動股票分析平台")
+st.title("📊 股市分析平台")
 st.caption("資料來源：Yahoo Finance（yfinance）｜僅供技術分析參考，非投資建議")
 
 with st.sidebar:
@@ -252,135 +248,7 @@ with st.sidebar:
         **半自動設計理念**
         本工具不會自動連續抓取資料，所有網路請求皆須由使用者
         點擊「一鍵更新與診斷」或「開始市場掃描」按鈕才會觸發，
-        避免不必要的 API 呼叫與過度交易訊號干擾。
+        避免不必要的 API 呼叫與過度交
 
-        **訊號定義**
-        - 🟢 買進：股價 > 60MA 且 KD 低檔(<30)黃金交叉
-        - 🟠 停利：收盤價跌破 10MA
-        - 🔴 停損：跌破進場日最低點
-        - 🔵 持有中：已進場但尚未觸及停利/停損
-        """
-    )
-    st.divider()
-    st.caption("⚠️ 本工具僅為技術指標運算輔助，不構成任何投資建議。")
-
-tab1, tab2 = st.tabs(["📌 自選股觀察與診斷", "🚀 市場強勢標的推薦"])
-
-# ============================================================
-# 分頁一 UI
-# ============================================================
-with tab1:
-    st.subheader("自選股清單管理")
-
-    col_input, col_btn = st.columns([3, 1])
-    with col_input:
-        new_ticker = st.text_input(
-            "輸入股票代號後按下新增（例如 2330.TW、2454.TW）",
-            key="new_ticker_input",
-            label_visibility="collapsed",
-            placeholder="例如：2330.TW",
-        )
-    with col_btn:
-        if st.button("➕ 新增至自選股", use_container_width=True):
-            t = new_ticker.strip().upper()
-            if not t:
-                st.warning("請輸入股票代號")
-            elif t in st.session_state.watchlist:
-                st.warning(f"{t} 已在清單中")
-            else:
-                st.session_state.watchlist.append(t)
-                st.success(f"已新增 {t}")
-                st.rerun()
-
-    if st.session_state.watchlist:
-        st.write("**目前自選股：**", "、".join(st.session_state.watchlist))
-        to_remove = st.multiselect("選擇要刪除的股票", st.session_state.watchlist, key="remove_select")
-        if st.button("🗑️ 刪除選定股票"):
-            for t in to_remove:
-                st.session_state.watchlist.remove(t)
-                st.session_state.holdings.pop(t, None)
-            st.rerun()
-    else:
-        st.info("目前尚無自選股，請於上方新增。")
-
-    st.divider()
-
-    # ------- 一鍵更新與診斷 -------
-    if st.button("🔄 一鍵更新與診斷", type="primary", use_container_width=True):
-        if not st.session_state.watchlist:
-            st.warning("請先新增至少一檔自選股")
-        else:
-            results = []
-            progress = st.progress(0, text="準備抓取資料...")
-            total = len(st.session_state.watchlist)
-            for i, ticker in enumerate(st.session_state.watchlist):
-                progress.progress((i + 1) / total, text=f"處理中：{ticker}")
-                df = fetch_data(ticker)
-                results.append(diagnose_stock(ticker, df))
-            progress.empty()
-            st.session_state.watchlist_result = pd.DataFrame(results)
-            st.success(f"更新完成，共處理 {total} 檔股票")
-
-    # ------- 結果表格 -------
-    if st.session_state.watchlist_result is not None and not st.session_state.watchlist_result.empty:
-        st.dataframe(style_watchlist(st.session_state.watchlist_result), use_container_width=True)
-
-        if st.session_state.holdings:
-            with st.expander("⚙️ 手動管理持股記錄（如需強制出場或修正進場低點）"):
-                reset_ticker = st.selectbox("選擇股票", list(st.session_state.holdings.keys()))
-                if st.button("清除此股票的持股記錄"):
-                    st.session_state.holdings.pop(reset_ticker, None)
-                    st.success(f"已清除 {reset_ticker} 的持股記錄")
-                    st.rerun()
-    else:
-        st.info("請點擊上方「一鍵更新與診斷」以取得最新分析結果。")
-
-# ============================================================
-# 分頁二 UI
-# ============================================================
-with tab2:
-    st.subheader("市場觀察清單設定")
-    st.caption("預設為台股權值股代表性清單，可自行編輯（逗號分隔），建議可擴充至完整前100大權值股。")
-
-    market_list_str = st.text_area(
-        "市場觀察清單",
-        value=",".join(DEFAULT_MARKET_LIST),
-        height=100,
-        label_visibility="collapsed",
-    )
-    market_list = [t.strip().upper() for t in market_list_str.split(",") if t.strip()]
-    st.caption(f"目前清單共 {len(market_list)} 檔股票")
-
-    st.divider()
-
-    if st.button("🚀 開始市場掃描", type="primary", use_container_width=True):
-        if not market_list:
-            st.warning("市場觀察清單為空，請至少輸入一檔股票代號")
-        else:
-            results = []
-            progress = st.progress(0, text="準備開始掃描...")
-            total = len(market_list)
-            for i, ticker in enumerate(market_list):
-                progress.progress((i + 1) / total, text=f"掃描中：{ticker}")
-                df = fetch_data(ticker)
-                res = scan_stock(ticker, df)
-                if res:
-                    results.append(res)
-            progress.empty()
-            st.session_state.market_scan_result = pd.DataFrame(results)
-            st.success(f"掃描完成，共檢視 {total} 檔股票")
-
-    if st.session_state.market_scan_result is not None:
-        result_df = st.session_state.market_scan_result
-        if result_df.empty:
-            st.info("目前無符合「站上60MA + KD低檔黃金交叉」條件之標的。")
-        else:
-            st.success(f"🎯 共篩選出 {len(result_df)} 檔強勢標的")
-            st.dataframe(
-                result_df.style.background_gradient(subset=["停損風險(%)"], cmap="RdYlGn_r"),
-                use_container_width=True,
-            )
-    else:
-        st.info("請點擊上方「開始市場掃描」以取得符合條件的標的。")
 
         
